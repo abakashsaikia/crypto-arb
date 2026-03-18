@@ -5,13 +5,14 @@ import csv
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Replaced Delta with Binance
 from binance_client import BinanceClient
 from coindcx_client import CoinDCXClient
 
+# 🎮 MASTER SWITCH: Set to False ONLY when you have real, funded API keys
+SIMULATION_MODE = True 
+TEST_TRADE_SIZE_USDT = 15.0  # Pretend to trade $15 worth of crypto per trade
+
 # --- 1. THE FOOLPROOF MASTER LIST --- 
-# This bypasses all security blocks. If a coin doesn't exist on one exchange, 
-# the MarketState brain safely ignores it.
 SYMBOLS_TO_TRADE = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "SHIBUSDT", 
     "MATICUSDT", "DOTUSDT", "LINKUSDT", "UNIUSDT", "LTCUSDT", "NEARUSDT", "ATOMUSDT", 
@@ -25,8 +26,8 @@ SYMBOLS_TO_TRADE = [
 ]
 
 # --- 2. CSV REPORTING ENGINE ---
-def log_arbitrage_to_csv(symbol, ex1, b1, ex2, b2, gross_gap, net_05, net_07, net_10):
-    """Generates the exact daily report format Abakash requested with multiple fee tiers."""
+# --- 2. CSV REPORTING ENGINE ---
+def log_arbitrage_to_csv(symbol, ex1, b1, ex2, b2, gross_gap, actual_net_profit):
     date_str = datetime.now().strftime("%Y-%m-%d")
     filename = f"arbitrage_report_{date_str}.csv"
     file_exists = os.path.isfile(filename)
@@ -36,21 +37,15 @@ def log_arbitrage_to_csv(symbol, ex1, b1, ex2, b2, gross_gap, net_05, net_07, ne
         
         if not file_exists:
             writer.writerow([
-                "Time", "Coin", 
-                "Exchange 1", "Ex1 Bid", "Ex1 Ask", 
+                "Time", "Coin", "Exchange 1", "Ex1 Bid", "Ex1 Ask", 
                 "Exchange 2", "Ex2 Bid", "Ex2 Ask", 
-                "Gross Gap %", "Net (0.5% Fee)", "Net (0.7% Fee)", "Net (1.0% Fee)"
+                "Gross Gap %", "Actual Net Profit % (After 0.3% Fees)"
             ])
 
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         writer.writerow([
-            timestamp, symbol,
-            ex1, b1['bid'], b1['ask'],
-            ex2, b2['bid'], b2['ask'],
-            f"{gross_gap:.4f}%",
-            f"{net_05:.4f}%",
-            f"{net_07:.4f}%",
-            f"{net_10:.4f}%"
+            timestamp, symbol, ex1, b1['bid'], b1['ask'], ex2, b2['bid'], b2['ask'],
+            f"{gross_gap:.4f}%", f"{actual_net_profit:.4f}%"
         ])
 
 
@@ -59,22 +54,23 @@ class MarketState:
     def __init__(self, exch1_client, exch2_client):
         self.books = {}
         self.last_print = 0
-        # Dynamically accepts Binance and CoinDCX
         self.clients = {"Binance": exch1_client, "CoinDCX": exch2_client}
         self.last_logged_time = {} 
 
-        # Risk Management
+        # Risk Management & Simulation Tracking
         self.is_killed = False                 
-        self.max_trade_usdt = 50.0             
-        self.max_loss_allowed = 10.0           
         self.loss_time_window = 300            
         self.trade_history = []                
         self.last_update = {"Binance": 0, "CoinDCX": 0} 
-        self._is_executing = False             
+        self._is_executing = False  
+        
+        # 💰 VIRTUAL WALLET
+        self.sim_start_balance = 1000.00
+        self.sim_balance = 1000.00
+        self.sim_total_trades = 0
 
     def update_book(self, exchange, symbol, book_data):
         self.last_update[exchange] = time.time() 
-        
         if symbol not in self.books: 
             self.books[symbol] = {}
         self.books[symbol][exchange] = book_data
@@ -88,93 +84,90 @@ class MarketState:
             return False
         return True
 
-    def evaluate_kill_switch(self):
-        if self.is_killed: return True
+    async def execute_arbitrage(self, symbol, buy_exchange_name, buy_price, sell_exchange_name, sell_price):
+        if self._is_executing: return
+        self._is_executing = True
+
+        qty = TEST_TRADE_SIZE_USDT / buy_price
+
+        # --- FAKE EXECUTION (PAPER TRADING) ---
+        if SIMULATION_MODE:
+            profit_usdt = (sell_price - buy_price) * qty
+            self.sim_balance += profit_usdt  # Add profit to virtual wallet
+            self.sim_total_trades += 1       # Track total trades
+
+            print("\n" + "═"*60)
+            print(f"🎮 [SIMULATION MODE] PAPER TRADE EXECUTED: {symbol}")
+            print(f"🟢 BUY  {qty:.4f} on {buy_exchange_name:<8} @ ${buy_price:.5f}")
+            print(f"🔴 SELL {qty:.4f} on {sell_exchange_name:<8} @ ${sell_price:.5f}")
+            print(f"💵 Net Profit from Trade: ${profit_usdt:.4f} USDT")
+            print("═"*60 + "\n")
             
-        now = time.time()
-        self.trade_history = [t for t in self.trade_history if now - t['time'] <= self.loss_time_window]
-        total_pnl = sum(t['pnl'] for t in self.trade_history)
-        
-        if total_pnl <= -self.max_loss_allowed:
-            print(f"\n💀 [KILL SWITCH ACTIVATED] Maximum loss exceeded! Trading Halted.")
-            self.is_killed = True
-            return True
-        return False
+            await asyncio.sleep(1) # Cooldown
+            self._is_executing = False
+            return
+
+        # --- REAL EXECUTION ---
+        print(f"\n🚀 [ATOMIC EXECUTION TRIGGERED] {symbol} | Firing real orders...")
+        buy_client = self.clients[buy_exchange_name]
+        sell_client = self.clients[sell_exchange_name]
+
+        results = await asyncio.gather(
+            buy_client.place_order(symbol, side="BUY", order_type="ioc", qty=qty, price=buy_price),
+            sell_client.place_order(symbol, side="SELL", order_type="ioc", qty=qty, price=sell_price),
+            return_exceptions=True
+        )
+
+        print(f"✅ [EXECUTION COMPLETE] Buy Leg: {results[0]} | Sell Leg: {results[1]}")
+        await asyncio.sleep(2)
+        self._is_executing = False
 
     def check_cross_exchange(self, symbol):
-        if self.evaluate_kill_switch(): return
-
+        if self.is_killed: return
         if symbol not in self.books: return
         exchs = list(self.books[symbol].keys())
         if len(exchs) < 2: return
 
         ex1, ex2 = exchs[0], exchs[1]
-        
         if not self.check_connectivity(ex1, ex2): return
-        
         b1, b2 = self.books[symbol][ex1], self.books[symbol][ex2]
         
         def handle_opportunity(buy_ex, buy_b, sell_ex, sell_b, gross_gap):
-            # Only log if the gross gap is higher than our lowest fee tier (0.5%)
-            if gross_gap > 0.5:
+            # 🚨 REALITY CHECK: Binance charges 0.1%, CoinDCX charges 0.2%. Total = 0.3%
+            TOTAL_FEE_PCT = 0.30
+            
+            # The gap must be larger than the fees for the trade to be profitable
+            if gross_gap > TOTAL_FEE_PCT:
                 now = time.time()
-                # Log to CSV (Max once per 60 seconds per coin to prevent spam)
-                if now - self.last_logged_time.get(symbol, 0) > 900:
+                # Cooldown set to 15 seconds for testing
+                if now - self.last_logged_time.get(symbol, 0) > 15:
                     
-                    # Calculate net profit for all 3 fee tiers
-                    net_05 = gross_gap - 0.5
-                    net_07 = gross_gap - 0.7
-                    net_10 = gross_gap - 1.0
+                    # Calculate EXACT take-home profit
+                    actual_net_profit = gross_gap - TOTAL_FEE_PCT
                     
-                    print(f"\n📝 [LOGGED TO CSV] {symbol} | Gross Gap: {gross_gap:.3f}%")
-                    log_arbitrage_to_csv(symbol, buy_ex, buy_b, sell_ex, sell_b, gross_gap, net_05, net_07, net_10)
+                    log_arbitrage_to_csv(symbol, buy_ex, buy_b, sell_ex, sell_b, gross_gap, actual_net_profit)
                     self.last_logged_time[symbol] = now
 
-        # DIRECTION 1: Buy Ex1, Sell Ex2
+                    asyncio.create_task(
+                        self.execute_arbitrage(symbol, buy_ex, buy_b['ask'], sell_ex, sell_b['bid'])
+                    )
         if b2['bid'] > b1['ask']:
-            # Calculate pure Gross Gap (No fees subtracted yet)
             gross_gap_pct = (((b2['bid'] - b1['ask']) / b1['ask']) * 100)
             handle_opportunity(ex1, b1, ex2, b2, gross_gap_pct)
 
-        # DIRECTION 2: Buy Ex2, Sell Ex1
         if b1['bid'] > b2['ask']:
-            # Calculate pure Gross Gap (No fees subtracted yet)
             gross_gap_pct = (((b1['bid'] - b2['ask']) / b2['ask']) * 100)
             handle_opportunity(ex2, b2, ex1, b1, gross_gap_pct)
-
-    async def execute_arbitrage(self, symbol, buy_exchange_name, buy_price, sell_exchange_name, sell_price, qty):
-        """
-        ATOMIC EXECUTION: Fires both the BUY and SELL orders concurrently.
-        If one fails, the other uses FOK/IOC to protect your capital.
-        """
-        if self._is_executing:
-            return  # Prevent double-firing if a gap is detected twice in a millisecond
-            
-        self._is_executing = True
-        print(f"\n🚀 [ATOMIC EXECUTION TRIGGERED] {symbol} | Gap Found! Firing orders...")
-
-        buy_client = self.clients[buy_exchange_name]
-        sell_client = self.clients[sell_exchange_name]
-
-        # asyncio.gather fires both requests to the APIs at the exact same millisecond
-        results = await asyncio.gather(
-            buy_client.place_order(symbol, side="BUY", order_type="limit", qty=qty, price=buy_price),
-            sell_client.place_order(symbol, side="SELL", order_type="limit", qty=qty, price=sell_price),
-            return_exceptions=True
-        )
-
-        buy_result, sell_result = results
-        print(f"✅ [EXECUTION COMPLETE] Buy Leg: {buy_result} | Sell Leg: {sell_result}")
-        
-        # Add a short cooldown to prevent API spam after a trade attempt
-        await asyncio.sleep(2)
-        self._is_executing = False
 
     def display_metrics(self):
         now = time.time()
         if now - self.last_print > 5:
             print("\n" + "="*80)
-            print(f"📊 UNIVERSAL SCANNER - Tracking {len(self.books)} Pairs (Latency Guard: ON)")
+            if SIMULATION_MODE:
+                total_pnl = self.sim_balance - self.sim_start_balance
+                print(f"💰 VIRTUAL WALLET: ${self.sim_balance:.4f} | Total PnL: ${total_pnl:+.4f} | Trades: {self.sim_total_trades}")
+            else:
+                print(f"📊 LIVE EXECUTION ENGINE - Tracking {len(self.books)} Pairs")
             print("="*80)
             
             gaps = []
@@ -186,7 +179,6 @@ class MarketState:
                     gap2 = ((b1['bid'] - b2['ask']) / b2['ask']) * 100
                     gaps.append((symbol, max(gap1, gap2), exchs[0], b1, exchs[1], b2))
             
-            # Sort and display the top 8 highest gaps
             gaps.sort(key=lambda x: x[1], reverse=True)
             for g in gaps[:8]:
                 print(f"🔹 {g[0]:<10} | Max Gap: {g[1]:+.4f}% | {g[2]}: {g[3]['bid']}/{g[3]['ask']} | {g[4]}: {g[5]['bid']}/{g[5]['ask']}")
@@ -198,7 +190,6 @@ class MarketState:
 async def main():
     load_dotenv()
     
-    # Initialize Binance instead of Delta
     binance = BinanceClient(os.getenv('BINANCE_KEY', ''), os.getenv('BINANCE_SECRET', ''))
     dcx = CoinDCXClient(os.getenv('COINDCX_KEY', ''), os.getenv('COINDCX_SECRET', ''))
     
@@ -206,7 +197,6 @@ async def main():
 
     print(f"--- 🚀 Starting Full Market Scanner for {len(SYMBOLS_TO_TRADE)} pairs ---")
     
-    # Run Binance and CoinDCX streams simultaneously
     await asyncio.gather(
         binance.start_stream(SYMBOLS_TO_TRADE, lambda s, p: state.update_book("Binance", s, p)),
         dcx.start_stream(SYMBOLS_TO_TRADE, lambda s, p: state.update_book("CoinDCX", s, p))

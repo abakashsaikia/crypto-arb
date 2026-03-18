@@ -7,23 +7,22 @@ class BaseExchangeClient(ABC):
 
     @abstractmethod
     def get_balance(self):
-        """Standardize balance into a simple dict: {'BTC': 1.0, 'USDT': 100}"""
         pass
 
     @abstractmethod
-    async def start_stream(self, callback):
-        """Standardize incoming price data and pass it to the callback"""
+    async def start_stream(self, symbols, callback):
+        """Accepts a LIST of symbols to track simultaneously."""
+        pass
+
+    @abstractmethod
+    async def place_order(self, symbol, side, order_type, qty, price=None):
+        """Executes trade. order_type: 'limit', 'market', 'fok'"""
         pass
 
     def normalize_symbol(self, symbol):
-        """
-        Forces all symbols into the 'BTC/USDT' format.
-        Each exchange has a different native format.
-        """
-        # Remove any common separators used by exchanges
         clean = symbol.replace("-", "").replace("_", "").upper()
-        
-        # Standardize known variations
         if clean == "BTCUSDT": return "BTC/USDT"
         if clean == "ETHUSDT": return "ETH/USDT"
-        return clean # Fallback
+        if clean == "SOLUSDT": return "SOL/USDT"
+        #if clean == "XRPUSDT": return "XRP/USDT"
+        return clean

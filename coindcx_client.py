@@ -2,67 +2,104 @@ import hmac
 import hashlib
 import time
 import json
-import requests
-import asyncio
 import aiohttp
+import asyncio
 from base_client import BaseExchangeClient
 
 class CoinDCXClient(BaseExchangeClient):
-    def __init__(self, api_key, secret_key):
+    def __init__(self, api_key="", secret_key=""):
         super().__init__(api_key, secret_key)
         self.base_url = "https://api.coindcx.com"
 
-    def get_balance(self):
+    async def get_balance(self):
+        """Fetches live wallet balances asynchronously to prevent blocking the engine."""
+        if not self.api_key or not self.secret_key:
+            return {}
+            
+        endpoint = "/exchange/v1/users/balances"
         body = {"timestamp": int(time.time() * 1000)}
         json_body = json.dumps(body, separators=(',', ':'))
+        
         signature = hmac.new(self.secret_key.encode(), json_body.encode(), hashlib.sha256).hexdigest()
-        headers = {'X-AUTH-APIKEY': self.api_key, 'X-AUTH-SIGNATURE': signature, 'Content-Type': 'application/json'}
-        try:
-            return requests.post(self.base_url + "/exchange/v1/users/balances", data=json_body, headers=headers).json()
-        except Exception: return {}
-
-    async def start_stream(self, callback):
-        print("[CoinDCX]  Starting L2 Order Book Poller...")
-        
-        # We use the public market data path which is often more stable for L2
-        url = "https://public.coindcx.com/market_data/orderbook?pair=B-BTC_USDT"
-        
-        # Headers to prevent 403 Forbidden errors
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-            "X-AUTH-APIKEY": self.api_key  # Some L2 endpoints now require the key for rate-limiting
+            'X-AUTH-APIKEY': self.api_key, 
+            'X-AUTH-SIGNATURE': signature, 
+            'Content-Type': 'application/json'
         }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self.base_url + endpoint, data=json_body, headers=headers) as response:
+                data = await response.json()
+                balances = {}
+                # CoinDCX returns a list of dictionaries for balances
+                if isinstance(data, list):
+                    for b in data:
+                        free = float(b.get('balance', 0))
+                        if free > 0:
+                            balances[b['currency']] = free
+                return balances
 
-        async with aiohttp.ClientSession(headers=headers) as session:
+    async def place_order(self, symbol, side, order_type, qty, price=None):
+        """Executes the trade instantly. Uses IOC to prevent getting stuck."""
+        endpoint = "/exchange/v1/orders/create"
+        
+        native_symbol = symbol.replace("/", "").replace("_", "").upper()
+        
+        # 🚨 Force IOC (Immediate-Or-Cancel) to protect against leg risk
+        dcx_order_type = "ioc" if order_type in ['limit', 'fok', 'ioc'] else "market_order"
+
+        body = {
+            "side": side.lower(),
+            "order_type": dcx_order_type,
+            "market": native_symbol,
+            "total_quantity": round(qty, 5),
+            "timestamp": int(time.time() * 1000)
+        }
+        
+        if price: 
+            body["price_per_unit"] = round(price, 5)
+
+        json_body = json.dumps(body, separators=(',', ':'))
+        signature = hmac.new(self.secret_key.encode(), json_body.encode(), hashlib.sha256).hexdigest()
+        
+        headers = {
+            'X-AUTH-APIKEY': self.api_key, 
+            'X-AUTH-SIGNATURE': signature, 
+            'Content-Type': 'application/json'
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self.base_url + endpoint, data=json_body, headers=headers) as response:
+                result = await response.json()
+                print(f"⚡ [CoinDCX Execution] {side} {qty} {symbol} @ {price} | Status: {result.get('status', 'FAILED')}")
+                return result
+
+    async def start_stream(self, symbols, callback):
+        print(f"[CoinDCX] 🔌 Starting Market Scanner for {len(symbols)} pairs...")
+        target_symbols = [s.replace("/", "").upper() for s in symbols] 
+        ticker_url = "https://api.coindcx.com/exchange/ticker"
+        
+        async with aiohttp.ClientSession() as session:
             while True:
                 try:
-                    async with session.get(url, timeout=10) as response:
+                    async with session.get(ticker_url, timeout=5) as response:
                         if response.status == 200:
                             data = await response.json()
-                            
-                            # CoinDCX L2 Parsing
-                            bids_dict = data.get('bids', {})
-                            asks_dict = data.get('asks', {})
-                            
-                            if bids_dict and asks_dict:
-                                # Convert string keys to floats and find top levels
-                                best_bid = max(float(p) for p in bids_dict.keys())
-                                best_ask = min(float(p) for p in asks_dict.keys())
+                            for ticker in data:
+                                market = ticker.get('market', '').upper()
+                                clean_market = market.replace("-", "").replace("_", "")
                                 
-                                symbol = self.normalize_symbol("BTCUSDT")
-                                callback(symbol, {"bid": best_bid, "ask": best_ask})
-                        
-                        elif response.status == 403:
-                            print("[CoinDCX Error] 403 Forbidden - Trying fallback headers...")
-                            # Fallback: Sometimes the API prefers no trailing slash or a different subdomain
-                            url = "https://api.coindcx.com/exchange/v1/market_data/orderbook?pair=B-BTC_USDT"
-                            
-                        else:
-                            print(f"[CoinDCX Error] Status {response.status}")
-                            
-                except Exception as e:
-                    print(f"[CoinDCX Exception] {e}")
-                
-                # Wait 2 seconds to avoid aggressive rate-limiting
+                                match_sym = None
+                                if clean_market in target_symbols:
+                                    match_sym = clean_market
+                                elif clean_market.startswith("B") and clean_market[1:] in target_symbols:
+                                    match_sym = clean_market[1:]
+                                    
+                                if match_sym:
+                                    bid = float(ticker.get('bid', 0))
+                                    ask = float(ticker.get('ask', 0))
+                                    if bid > 0 and ask > 0:
+                                        callback(self.normalize_symbol(match_sym), {"bid": bid, "ask": ask})
+                except Exception: 
+                    pass
                 await asyncio.sleep(2.0)
